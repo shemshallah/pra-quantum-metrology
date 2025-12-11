@@ -1,0 +1,454 @@
+"""
+QUANTUM FOAM DETECTION SUITE - 255 BASIS COMPREHENSIVE TOMOGRAPHY
+===================================================================
+
+EXPERIMENTAL DESIGN: Testing Measurement-Context-Dependent Quantum Foam Coupling
+
+HYPOTHESIS:
+If quantum foam coupling is real, then the number and type of measurement bases
+should affect the reconstructed quantum state beyond statistical noise.
+
+PREDICTION:
+- Standard QM: State quality independent of basis count (4 vs 16 vs 255)
+- Foam coupling: State degrades with measurement context complexity
+
+This experiment will definitively answer: Does quantum tomography itself 
+perturb the quantum foam substrate?
+
+QBraid + IonQ Simulator
+"""
+
+import numpy as np
+from qbraid.runtime import QbraidProvider
+from qiskit import QuantumCircuit
+import time
+from datetime import datetime
+import pandas as pd
+from itertools import product
+import os
+
+# ============================================================================
+# API CONFIGURATION
+# ============================================================================
+os.environ['QBRAID_API_KEY'] = 'xxx'
+
+# ============================================================================
+# EXPERIMENTAL PARAMETERS
+# ============================================================================
+# Test multiple shot counts to probe statistical vs foam effects
+SHOT_CONFIGS = [
+    {'shots': 500, 'label': 'low_statistics'},
+    {'shots': 2000, 'label': 'standard'},
+    {'shots': 10000, 'label': 'high_statistics'}
+]
+
+# Test key angles that probe different correlation structures
+ANGLES = [0, 22.5, 45, 67.5, 90]  # 5 angles covering full range
+
+# Three basis sets to compare
+BASIS_SETS = {
+    'minimal_4': ['XXZZ', 'YYZZ', 'XYZZ', 'ZZZZ'],  # Minimal complete set
+    'standard_16': None,  # Will generate 16-basis set
+    'complete_255': None  # Will generate all 255 bases
+}
+
+MAX_JOBS_PER_BATCH = 50
+BATCH_DELAY = 2
+
+print("=" * 80)
+print("QUANTUM FOAM DETECTION SUITE")
+print("=" * 80)
+print("\nEXPERIMENT DESIGN:")
+print(f"  Shot configs: {len(SHOT_CONFIGS)} (500, 2000, 10000)")
+print(f"  Angles: {len(ANGLES)} ({ANGLES})")
+print(f"  Basis sets: 3 (4, 16, 255)")
+print(f"  Total measurements: {len(SHOT_CONFIGS) * len(ANGLES) * 3} configurations")
+print("\nHYPOTHESIS TEST:")
+print("  H0 (Standard QM): State quality independent of basis count")
+print("  H1 (Foam coupling): State degrades with measurement complexity")
+
+# ============================================================================
+# PAULI MATRICES & BASIS GENERATION
+# ============================================================================
+PAULI_I = np.array([[1, 0], [0, 1]], dtype=complex)
+PAULI_X = np.array([[0, 1], [1, 0]], dtype=complex)
+PAULI_Y = np.array([[0, -1j], [1j, 0]], dtype=complex)
+PAULI_Z = np.array([[1, 0], [0, -1]], dtype=complex)
+PAULI_MATRICES = {'I': PAULI_I, 'X': PAULI_X, 'Y': PAULI_Y, 'Z': PAULI_Z}
+
+def generate_16_basis_set():
+    """Generate informationally complete 16-basis set"""
+    return [
+        'ZZZZ', 'XZZZ', 'ZXZZ', 'YZZZ', 'ZYZZ',
+        'XXZZ', 'YYZZ', 'XYZZ', 'YXZZ',
+        'ZZXZ', 'ZZZX', 'ZZYZ', 'ZZZY',
+        'XXXX', 'YYYY', 'XYXY'
+    ]
+
+def generate_255_basis_set():
+    """Generate all 255 non-identity 4-qubit Pauli bases"""
+    paulis = ['I', 'X', 'Y', 'Z']
+    bases = []
+    for pauli_string in product(paulis, repeat=4):
+        bases.append(''.join(pauli_string))
+    # Remove all-identity
+    bases = [b for b in bases if b != 'IIII']
+    return bases
+
+BASIS_SETS['standard_16'] = generate_16_basis_set()
+BASIS_SETS['complete_255'] = generate_255_basis_set()
+
+print(f"\n✓ Generated basis sets:")
+print(f"  Minimal (4):    {BASIS_SETS['minimal_4']}")
+print(f"  Standard (16):  {len(BASIS_SETS['standard_16'])} bases")
+print(f"  Complete (255): {len(BASIS_SETS['complete_255'])} bases")
+
+# ============================================================================
+# CIRCUIT CREATION
+# ============================================================================
+def create_bell_circuit(theta_deg, basis_string, n_qubits=4):
+    """
+    Create Bell state with rotation and measurement basis
+    
+    Bell pair on qubits 0,1: (|00⟩ + e^(iθ)|11⟩)/√2
+    Qubits 2,3 are ancillas (remain in |0⟩)
+    """
+    qc = QuantumCircuit(n_qubits)
+    
+    # Bell pair
+    qc.h(0)
+    qc.cx(0, 1)
+    
+    # Rotation
+    theta_rad = np.radians(theta_deg)
+    qc.rz(theta_rad, 0)
+    
+    # Measurement basis transformations
+    for i, pauli in enumerate(basis_string):
+        if pauli == 'X':
+            qc.h(i)
+        elif pauli == 'Y':
+            qc.sdg(i)
+            qc.h(i)
+    
+    return qc
+
+# ============================================================================
+# PROPER 2-QUBIT PAULI EXPECTATION EXTRACTION
+# ============================================================================
+def extract_pauli_expectation_2qubit(counts, basis_string, shots):
+    """
+    Extract Pauli expectation for 2-qubit Bell pair (qubits 0,1)
+    Handles variable-length bitstrings from IonQ
+    """
+    expectation = 0.0
+    basis_2qubit = basis_string[:2]  # Only care about first 2 qubits
+    
+    for bitstring_raw, count in counts.items():
+        prob = count / shots
+        bitstring = bitstring_raw.zfill(4)  # Pad to 4 bits
+        
+        # Eigenvalue for 2-qubit Pauli
+        eigenvalue = 1.0
+        for bit_idx in range(2):  # Only first 2 qubits
+            pauli = basis_2qubit[bit_idx]
+            if pauli != 'I':
+                bit_value = int(bitstring[bit_idx])
+                eigenvalue *= (-1) ** bit_value
+        
+        expectation += prob * eigenvalue
+    
+    return expectation
+
+def tensor_product_2qubit(pauli1, pauli2):
+    """2-qubit Pauli tensor product"""
+    return np.kron(PAULI_MATRICES[pauli1], PAULI_MATRICES[pauli2])
+
+def reconstruct_2qubit_density_matrix(pauli_expectations):
+    """
+    Reconstruct 2-qubit density matrix using MLE
+    
+    Only uses measurements on qubits 0,1 (Bell pair)
+    Ignores ancilla qubits 2,3
+    """
+    dim = 4
+    rho = np.eye(dim, dtype=np.complex128) / dim
+    
+    for basis_4qubit, expectation in pauli_expectations.items():
+        basis_2qubit = basis_4qubit[:2]
+        # Only use if ancillas are in Z (computational) basis
+        if len(basis_4qubit) >= 4 and basis_4qubit[2:] == 'ZZ':
+            if basis_2qubit != 'II':
+                pauli_op = tensor_product_2qubit(basis_2qubit[0], basis_2qubit[1])
+                rho = rho + (float(expectation) / dim) * pauli_op
+    
+    # Physical constraints
+    rho = (rho + rho.conj().T) / 2
+    eigenvalues, eigenvectors = np.linalg.eigh(rho)
+    eigenvalues = np.maximum(eigenvalues, 0)
+    rho = eigenvectors @ np.diag(eigenvalues) @ eigenvectors.conj().T
+    rho = rho / np.trace(rho)
+    
+    return rho
+
+# ============================================================================
+# QUANTUM INFORMATION METRICS
+# ============================================================================
+def von_neumann_entropy(rho):
+    """Von Neumann entropy S = -Tr(ρ log₂ ρ)"""
+    eigenvalues = np.linalg.eigvalsh(rho)
+    eigenvalues = eigenvalues[eigenvalues > 1e-12]
+    return -np.sum(eigenvalues * np.log2(eigenvalues + 1e-12))
+
+def partial_trace_qubit(rho_2qubit, trace_out):
+    """Partial trace for 2-qubit system"""
+    if trace_out == 0:
+        rho_1 = np.array([[rho_2qubit[0,0] + rho_2qubit[2,2], rho_2qubit[0,1] + rho_2qubit[2,3]],
+                          [rho_2qubit[1,0] + rho_2qubit[3,2], rho_2qubit[1,1] + rho_2qubit[3,3]]])
+        return rho_1
+    else:
+        rho_0 = np.array([[rho_2qubit[0,0] + rho_2qubit[1,1], rho_2qubit[0,2] + rho_2qubit[1,3]],
+                          [rho_2qubit[2,0] + rho_2qubit[3,1], rho_2qubit[2,2] + rho_2qubit[3,3]]])
+        return rho_0
+
+def calculate_purity(rho):
+    """Purity Tr(ρ²)"""
+    return np.real(np.trace(rho @ rho))
+
+def calculate_fidelity_bell(rho, theta_deg):
+    """Fidelity with ideal Bell state"""
+    theta_rad = np.radians(theta_deg)
+    psi_ideal = np.array([1/np.sqrt(2), 0, 0, np.exp(1j * theta_rad)/np.sqrt(2)])
+    return np.real(psi_ideal.conj() @ rho @ psi_ideal)
+
+def calculate_concurrence(rho):
+    """Concurrence (entanglement measure)"""
+    sigma_y = np.array([[0, -1j], [1j, 0]])
+    sigma_y_tensor = np.kron(sigma_y, sigma_y)
+    rho_tilde = sigma_y_tensor @ rho.conj() @ sigma_y_tensor
+    R = rho @ rho_tilde
+    eigenvalues = np.linalg.eigvalsh(R)
+    eigenvalues = np.sqrt(np.maximum(eigenvalues, 0))
+    eigenvalues = np.sort(eigenvalues)[::-1]
+    C = max(0, eigenvalues[0] - eigenvalues[1] - eigenvalues[2] - eigenvalues[3])
+    return C
+
+# ============================================================================
+# QBRAID CONNECTION
+# ============================================================================
+try:
+    provider = QbraidProvider()
+    device = provider.get_device('ionq_simulator')
+    print(f"\n✓ Connected to: {device.id}")
+    print(f"✓ Status: {device.status()}")
+except Exception as e:
+    print(f"\n✗ Connection error: {e}")
+    raise
+
+# ============================================================================
+# MAIN EXPERIMENTAL LOOP
+# ============================================================================
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+results_file = f"foam_detection_suite_{timestamp}.csv"
+detailed_file = f"foam_detection_detailed_{timestamp}.csv"
+
+all_results = []
+detailed_measurements = []
+
+total_configs = len(SHOT_CONFIGS) * len(ANGLES) * len(BASIS_SETS)
+config_counter = 0
+
+print("\n" + "=" * 80)
+print("STARTING FOAM DETECTION EXPERIMENT SUITE")
+print("=" * 80)
+
+for shot_config in SHOT_CONFIGS:
+    shots = shot_config['shots']
+    shot_label = shot_config['label']
+    
+    print(f"\n{'='*80}")
+    print(f"SHOT CONFIGURATION: {shots} shots ({shot_label})")
+    print(f"{'='*80}")
+    
+    for basis_name, bases in BASIS_SETS.items():
+        n_bases = len(bases)
+        
+        print(f"\n{'-'*80}")
+        print(f"BASIS SET: {basis_name} ({n_bases} bases)")
+        print(f"{'-'*80}")
+        
+        for angle_idx, theta in enumerate(ANGLES):
+            config_counter += 1
+            
+            print(f"\n[Config {config_counter}/{total_configs}] θ={theta}°, {n_bases} bases, {shots} shots")
+            print(f"{'·'*60}")
+            
+            start_time = time.time()
+            
+            # Step 1: Create circuits
+            print(f"  [1/5] Creating {n_bases} circuits...", end='', flush=True)
+            circuits = [create_bell_circuit(theta, basis) for basis in bases]
+            print(f" ✓ ({len(circuits)} circuits)")
+            
+            # Step 2: Submit in batches
+            print(f"  [2/5] Submitting to IonQ...", end='', flush=True)
+            n_batches = (n_bases + MAX_JOBS_PER_BATCH - 1) // MAX_JOBS_PER_BATCH
+            jobs = []
+            
+            for batch_idx in range(n_batches):
+                start_idx = batch_idx * MAX_JOBS_PER_BATCH
+                end_idx = min(start_idx + MAX_JOBS_PER_BATCH, n_bases)
+                batch_circuits = circuits[start_idx:end_idx]
+                
+                for qc in batch_circuits:
+                    job = device.run(qc, shots=shots)
+                    jobs.append(job)
+                
+                if batch_idx < n_batches - 1:
+                    time.sleep(BATCH_DELAY)
+            
+            print(f" ✓ ({len(jobs)} jobs)")
+            
+            # Step 3: Collect results
+            print(f"  [3/5] Collecting results...", end='', flush=True)
+            measurement_results = []
+            for job in jobs:
+                result = job.result()
+                measurement_results.append(result)
+            print(f" ✓ ({len(measurement_results)} results)")
+            
+            # Step 4: Extract Pauli expectations
+            print(f"  [4/5] Extracting Pauli expectations...", end='', flush=True)
+            pauli_expectations = {}
+            for basis, result in zip(bases, measurement_results):
+                counts = result.data.get_counts()
+                expectation = extract_pauli_expectation_2qubit(counts, basis, shots)
+                pauli_expectations[basis] = expectation
+                
+                # Store detailed measurement
+                detailed_measurements.append({
+                    'shot_config': shot_label,
+                    'shots': shots,
+                    'basis_set': basis_name,
+                    'n_bases': n_bases,
+                    'theta': theta,
+                    'basis': basis,
+                    'expectation': expectation,
+                    'counts': str(counts)
+                })
+            print(f" ✓ ({len(pauli_expectations)} expectations)")
+            
+            # Step 5: Reconstruct and analyze
+            print(f"  [5/5] Reconstructing density matrix...", end='', flush=True)
+            rho = reconstruct_2qubit_density_matrix(pauli_expectations)
+            
+            # Calculate metrics
+            purity = calculate_purity(rho)
+            fidelity = calculate_fidelity_bell(rho, theta)
+            concurrence = calculate_concurrence(rho)
+            
+            S_AB = von_neumann_entropy(rho)
+            rho_A = partial_trace_qubit(rho, trace_out=1)
+            rho_B = partial_trace_qubit(rho, trace_out=0)
+            S_A = von_neumann_entropy(rho_A)
+            S_B = von_neumann_entropy(rho_B)
+            I_AB = S_A + S_B - S_AB
+            
+            elapsed = time.time() - start_time
+            print(f" ✓ ({elapsed:.1f}s)")
+            
+            # Observable errors
+            theta_rad = np.radians(theta)
+            xx_measured = pauli_expectations.get('XXZZ', 0)
+            yy_measured = pauli_expectations.get('YYZZ', 0)
+            xy_measured = pauli_expectations.get('XYZZ', 0)
+            
+            xx_error = abs(xx_measured - np.cos(theta_rad))
+            yy_error = abs(yy_measured - (-np.cos(theta_rad)))
+            xy_error = abs(xy_measured - np.sin(theta_rad))
+            observable_error_avg = (xx_error + yy_error + xy_error) / 3
+            
+            # Print quick summary
+            print(f"      Purity: {purity:.6f}  Fidelity: {fidelity:.6f}  Concurrence: {concurrence:.6f}")
+            
+            # Store results
+            all_results.append({
+                'shot_config': shot_label,
+                'shots': shots,
+                'basis_set': basis_name,
+                'n_bases': n_bases,
+                'theta': theta,
+                'purity': purity,
+                'fidelity': fidelity,
+                'concurrence': concurrence,
+                'S_A': S_A,
+                'S_B': S_B,
+                'S_AB': S_AB,
+                'I_AB': I_AB,
+                'observable_error': observable_error_avg,
+                'elapsed_time': elapsed,
+                'total_shots': n_bases * shots
+            })
+
+# Save results
+df_results = pd.DataFrame(all_results)
+df_results.to_csv(results_file, index=False)
+
+df_detailed = pd.DataFrame(detailed_measurements)
+df_detailed.to_csv(detailed_file, index=False)
+
+print("\n" + "=" * 80)
+print("FOAM DETECTION SUITE COMPLETE")
+print("=" * 80)
+print(f"\nResults saved to:")
+print(f"  Summary:  {results_file}")
+print(f"  Detailed: {detailed_file}")
+
+# ============================================================================
+# STATISTICAL ANALYSIS
+# ============================================================================
+print("\n" + "=" * 80)
+print("STATISTICAL ANALYSIS - TESTING FOR FOAM EFFECTS")
+print("=" * 80)
+
+# Group by basis set and shot config
+for shot_label in df_results['shot_config'].unique():
+    print(f"\n{shot_label.upper()} ({df_results[df_results['shot_config']==shot_label]['shots'].iloc[0]} shots)")
+    print("-" * 80)
+    
+    shot_data = df_results[df_results['shot_config'] == shot_label]
+    
+    for metric in ['purity', 'fidelity', 'concurrence']:
+        print(f"\n{metric.capitalize()}:")
+        for basis_name in ['minimal_4', 'standard_16', 'complete_255']:
+            basis_data = shot_data[shot_data['basis_set'] == basis_name]
+            if len(basis_data) > 0:
+                mean = basis_data[metric].mean()
+                std = basis_data[metric].std()
+                print(f"  {basis_name:>15}: {mean:.6f} ± {std:.6f}")
+
+print("\n" + "=" * 80)
+print("FOAM COUPLING VERDICT")
+print("=" * 80)
+
+# Compare 4-basis vs 255-basis at high statistics
+high_stats_4 = df_results[(df_results['shot_config']=='high_statistics') & 
+                          (df_results['basis_set']=='minimal_4')]
+high_stats_255 = df_results[(df_results['shot_config']=='high_statistics') & 
+                            (df_results['basis_set']=='complete_255')]
+
+if len(high_stats_4) > 0 and len(high_stats_255) > 0:
+    purity_diff = high_stats_4['purity'].mean() - high_stats_255['purity'].mean()
+    fidelity_diff = high_stats_4['fidelity'].mean() - high_stats_255['fidelity'].mean()
+    
+    print(f"\nPurity degradation (4→255 bases):    {purity_diff:+.6f}")
+    print(f"Fidelity degradation (4→255 bases):  {fidelity_diff:+.6f}")
+    
+    if abs(purity_diff) > 0.01 or abs(fidelity_diff) > 0.01:
+        print("\n⚠ SIGNIFICANT DEGRADATION DETECTED!")
+        print("→ Possible quantum foam measurement-context coupling")
+    else:
+        print("\n✓ NO SIGNIFICANT DEGRADATION")
+        print("→ Consistent with standard quantum mechanics")
+
+print("\n" + "=" * 80)

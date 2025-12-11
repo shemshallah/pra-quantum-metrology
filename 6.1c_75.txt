@@ -1,0 +1,706 @@
+
+#!/usr/bin/env python3
+"""
+COMPREHENSIVE VERIFICATION SUITE V2
+====================================
+Address all concerns from initial verification
+
+IMPROVEMENTS:
+- All measurements at 5000 shots (high statistics)
+- Test 6 extended to 10 repetitions (3σ target)
+- Fixed GHZ preparation for N≥6
+- 60 total measurements
+- 15 minute runtime target
+"""
+
+import numpy as np
+from qiskit import QuantumCircuit, transpile
+from azure.quantum import Workspace
+from azure.quantum.qiskit import AzureQuantumProvider
+import time
+import warnings
+from scipy.stats import entropy
+from collections import defaultdict
+import csv
+import json
+warnings.filterwarnings('ignore')
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+CONNECTION_STRING = "SubscriptionId=xxx;ResourceGroupName=xxx;WorkspaceName=xxx;ApiKey=xxx;QuantumEndpoint=https://westus.quantum.azure.com/;"
+MAX_RUNTIME = 15 * 60  # 15 minutes
+SHOTS = 5000  # High statistics for all measurements
+
+print("="*80)
+print("   COMPREHENSIVE VERIFICATION SUITE V2")
+print("="*80)
+print("\nImprovements over V1:")
+print("  ✓ All measurements at 5000 shots (maximum precision)")
+print("  ✓ Test 6 extended to 10 reps (3σ target)")
+print("  ✓ Fixed GHZ preparation for N≥6")
+print("  ✓ Additional angular scan for validation")
+print("  ✓ Y and Bell basis verification")
+print("\nTarget: 60 measurements in 15 minutes")
+print("="*80 + "\n")
+
+# ============================================================================
+# BACKEND CONNECTION
+# ============================================================================
+workspace = Workspace.from_connection_string(CONNECTION_STRING)
+provider = AzureQuantumProvider(workspace)
+backend = None
+
+for b in provider.backends():
+    if 'rigetti' in b.name.lower() and 'qvm' in b.name.lower():
+        backend = provider.get_backend(b.name)
+        print(f"✓ Connected: {b.name}\n")
+        break
+
+if not backend:
+    raise RuntimeError("Rigetti QVM not found!")
+
+start_time = time.time()
+
+# ============================================================================
+# FIXED GHZ CIRCUIT
+# ============================================================================
+
+def create_rotated_ghz_FIXED(n_qubits, theta_deg):
+    """FIXED: Full entangling chain for all qubits"""
+    qc = QuantumCircuit(n_qubits, n_qubits)
+    theta = np.radians(theta_deg)
+    
+    # Full GHZ preparation (NO LIMIT)
+    qc.h(0)
+    for i in range(n_qubits-1):  # FIXED: No min() limit
+        qc.cx(i, i+1)
+    
+    # Parametric rotation
+    qc.ry(theta, 0)
+    if n_qubits > 1:
+        qc.ry(theta/2, 1)
+    
+    return qc
+
+def apply_measurement_basis(qc, basis, n_qubits):
+    """Apply basis transformation"""
+    if basis == 'Z':
+        pass
+    elif basis == 'X':
+        for i in range(n_qubits):
+            qc.h(i)
+    elif basis == 'Y':
+        for i in range(n_qubits):
+            qc.sdg(i)
+            qc.h(i)
+    elif basis == 'Bell':
+        for i in range(0, n_qubits-1, 2):
+            if i+1 < n_qubits:
+                qc.cx(i, i+1)
+                qc.h(i)
+    
+    qc.measure(range(n_qubits), range(n_qubits))
+    return qc
+
+def calculate_discord_from_counts(counts, n_qubits):
+    """Calculate discord using steering formula"""
+    total_shots = sum(counts.values())
+    
+    counts_0 = defaultdict(int)
+    counts_1 = defaultdict(int)
+    
+    for bitstring, count in counts.items():
+        bits = bitstring[::-1]
+        if len(bits) >= n_qubits:
+            if bits[0] == '0':
+                counts_0[bits[1:]] += count
+            else:
+                counts_1[bits[1:]] += count
+    
+    total_0 = sum(counts_0.values())
+    total_1 = sum(counts_1.values())
+    
+    if total_0 == 0 or total_1 == 0:
+        return 0.0, 0.0
+    
+    p_0 = total_0 / total_shots
+    p_1 = total_1 / total_shots
+    
+    def calc_entropy(counts_dict, total):
+        if total == 0:
+            return 0
+        probs = [c/total for c in counts_dict.values() if c > 0]
+        return entropy(probs, base=2) if len(probs) > 0 else 0
+    
+    H_0 = calc_entropy(counts_0, total_0)
+    H_1 = calc_entropy(counts_1, total_1)
+    
+    all_subsystem = defaultdict(int)
+    for bitstring, count in counts.items():
+        bits = bitstring[::-1]
+        if len(bits) >= n_qubits:
+            all_subsystem[bits[1:]] += count
+    
+    H_total = calc_entropy(all_subsystem, total_shots)
+    discord = H_total - (p_0 * H_0 + p_1 * H_1)
+    
+    H_A = entropy([p_0, p_1], base=2) if p_0 > 0 and p_1 > 0 else 0
+    H_joint = calc_entropy(counts, total_shots)
+    mutual_info = H_A + H_total - H_joint
+    
+    return max(0, discord), mutual_info
+
+# ============================================================================
+# STREAMLINED TESTS
+# ============================================================================
+
+class MeasurementCounter:
+    """Global counter for measurements"""
+    def __init__(self):
+        self.count = 0
+    
+    def increment(self):
+        self.count += 1
+    
+    def get_count(self):
+        return self.count
+
+counter = MeasurementCounter()
+
+def run_measurement(qc, label=""):
+    """Execute single measurement and return results"""
+    try:
+        qc_trans = transpile(qc, backend=backend, optimization_level=3)
+        job = backend.run(qc_trans, shots=SHOTS)
+        counts = job.result().get_counts()
+        counter.increment()
+        
+        if label:
+            print(f".", end='', flush=True)
+        
+        return counts, qc_trans
+    except Exception as e:
+        print(f"E", end='', flush=True)
+        return None, None
+
+def test_suite_v2():
+    """Run all tests in streamlined fashion"""
+    
+    all_results = {}
+    
+    print("\n" + "█"*80)
+    print("RUNNING COMPREHENSIVE VERIFICATION SUITE V2")
+    print("█"*80 + "\n")
+    
+    # ========================================================================
+    # TEST 1: Software Bug Check (4 measurements)
+    # ========================================================================
+    print("TEST 1: Software Bug Check (4 measurements)")
+    print("  Testing Z and X basis, standard vs manual implementation")
+    print("  ", end='', flush=True)
+    
+    test1_results = []
+    n, theta = 4, 75
+    
+    for basis in ['Z', 'X']:
+        # Standard
+        qc = create_rotated_ghz_FIXED(n, theta)
+        qc = apply_measurement_basis(qc, basis, n)
+        counts, _ = run_measurement(qc)
+        if counts:
+            discord, mi = calculate_discord_from_counts(counts, n)
+            test1_results.append({
+                'method': 'standard', 'basis': basis,
+                'discord': discord, 'mutual_info': mi
+            })
+        
+        # Manual
+        qc = QuantumCircuit(n, n)
+        qc.h(0)
+        for i in range(n-1):
+            qc.cx(i, i+1)
+        qc.ry(np.radians(theta), 0)
+        qc.ry(np.radians(theta/2), 1)
+        if basis == 'X':
+            for i in range(n):
+                qc.h(i)
+        qc.measure(range(n), range(n))
+        counts, _ = run_measurement(qc)
+        if counts:
+            discord, mi = calculate_discord_from_counts(counts, n)
+            test1_results.append({
+                'method': 'manual', 'basis': basis,
+                'discord': discord, 'mutual_info': mi
+            })
+    
+    print(" ✓")
+    all_results['test1'] = test1_results
+    
+    # ========================================================================
+    # TEST 2: High-Shot Validation (2 measurements)
+    # ========================================================================
+    print("\nTEST 2: High-Shot Validation (2 measurements)")
+    print("  Confirming basis difference persists at 5000 shots")
+    print("  ", end='', flush=True)
+    
+    test2_results = []
+    for basis in ['Z', 'X']:
+        qc = create_rotated_ghz_FIXED(n, theta)
+        qc = apply_measurement_basis(qc, basis, n)
+        counts, _ = run_measurement(qc)
+        if counts:
+            discord, mi = calculate_discord_from_counts(counts, n)
+            test2_results.append({
+                'basis': basis, 'discord': discord,
+                'mutual_info': mi, 'shots': SHOTS
+            })
+    
+    print(" ✓")
+    all_results['test2'] = test2_results
+    
+    # ========================================================================
+    # TEST 3: Formula Validation (3 measurements)
+    # ========================================================================
+    print("\nTEST 3: Formula Validation (3 measurements)")
+    print("  Testing on |00⟩, Bell state, GHZ(θ=0)")
+    print("  ", end='', flush=True)
+    
+    test3_results = []
+    
+    # |00⟩
+    qc = QuantumCircuit(4, 4)
+    qc.measure(range(4), range(4))
+    counts, _ = run_measurement(qc)
+    if counts:
+        discord, _ = calculate_discord_from_counts(counts, 4)
+        test3_results.append({'state': '|00⟩', 'discord': discord, 'theory': 0.0})
+    
+    # Bell state
+    qc = QuantumCircuit(2, 2)
+    qc.h(0)
+    qc.cx(0, 1)
+    qc.measure(range(2), range(2))
+    counts, _ = run_measurement(qc)
+    if counts:
+        discord, _ = calculate_discord_from_counts(counts, 2)
+        test3_results.append({'state': 'Bell', 'discord': discord, 'theory': 1.0})
+    
+    # GHZ(θ=0)
+    qc = create_rotated_ghz_FIXED(4, 0)
+    qc.measure(range(4), range(4))
+    counts, _ = run_measurement(qc)
+    if counts:
+        discord, _ = calculate_discord_from_counts(counts, 4)
+        test3_results.append({'state': 'GHZ', 'discord': discord, 'theory': 1.0})
+    
+    print(" ✓")
+    all_results['test3'] = test3_results
+    
+    # ========================================================================
+    # TEST 4: FIXED State Preparation (3 measurements)
+    # ========================================================================
+    print("\nTEST 4: FIXED State Preparation (3 measurements)")
+    print("  Testing GHZ fidelity with corrected circuit")
+    print("  ", end='', flush=True)
+    
+    test4_results = []
+    for n_test in [4, 6, 8]:
+        qc = QuantumCircuit(n_test, n_test)
+        qc.h(0)
+        for i in range(n_test-1):  # FIXED: Full chain
+            qc.cx(i, i+1)
+        qc.measure(range(n_test), range(n_test))
+        
+        counts, _ = run_measurement(qc)
+        if counts:
+            total = sum(counts.values())
+            p_all_zero = counts.get('0'*n_test, 0) / total
+            p_all_one = counts.get('1'*n_test, 0) / total
+            fidelity = p_all_zero + p_all_one
+            test4_results.append({
+                'n_qubits': n_test, 'fidelity': fidelity,
+                'p_zero': p_all_zero, 'p_one': p_all_one
+            })
+    
+    print(" ✓")
+    all_results['test4'] = test4_results
+    
+    # ========================================================================
+    # TEST 5: Transpilation Check (2 measurements)
+    # ========================================================================
+    print("\nTEST 5: Transpilation Consistency (2 measurements)")
+    print("  Comparing opt_level 0 vs 3")
+    print("  ", end='', flush=True)
+    
+    test5_results = []
+    for opt_level in [0, 3]:
+        qc = create_rotated_ghz_FIXED(4, 45)
+        qc = apply_measurement_basis(qc, 'X', 4)
+        
+        qc_trans = transpile(qc, backend=backend, optimization_level=opt_level)
+        job = backend.run(qc_trans, shots=SHOTS)
+        counts = job.result().get_counts()
+        counter.increment()
+        print(".", end='', flush=True)
+        
+        discord, _ = calculate_discord_from_counts(counts, 4)
+        test5_results.append({
+            'opt_level': opt_level,
+            'depth': qc_trans.depth(),
+            'discord': discord
+        })
+    
+    print(" ✓")
+    all_results['test5'] = test5_results
+    
+    # ========================================================================
+    # TEST 6: EXTENDED Reproducibility (20 measurements)
+    # ========================================================================
+    print("\nTEST 6: EXTENDED Reproducibility (20 measurements)")
+    print("  10 reps each for Z and X basis (targeting 3σ)")
+    print("  Z-basis: ", end='', flush=True)
+    
+    test6_results = []
+    n, theta = 4, 45
+    
+    for basis in ['Z', 'X']:
+        discords = []
+        for rep in range(10):
+            if time.time() - start_time > MAX_RUNTIME:
+                break
+            
+            qc = create_rotated_ghz_FIXED(n, theta)
+            qc = apply_measurement_basis(qc, basis, n)
+            counts, _ = run_measurement(qc)
+            
+            if counts:
+                discord, _ = calculate_discord_from_counts(counts, n)
+                discords.append(discord)
+        
+        if basis == 'Z':
+            print(f"\n  X-basis: ", end='', flush=True)
+        
+        if discords:
+            test6_results.append({
+                'basis': basis,
+                'discords': discords,
+                'mean': np.mean(discords),
+                'std': np.std(discords),
+                'n': len(discords)
+            })
+    
+    print(" ✓")
+    all_results['test6'] = test6_results
+    
+    # ========================================================================
+    # TEST 7: Angular Scan Validation (12 measurements)
+    # ========================================================================
+    print("\nTEST 7: Angular Dependence Verification (12 measurements)")
+    print("  Testing θ = 0°, 30°, 45°, 60°, 75°, 90° in Z and X basis")
+    print("  ", end='', flush=True)
+    
+    test7_results = []
+    angles = [0, 30, 45, 60, 75, 90]
+    
+    for theta_test in angles:
+        if time.time() - start_time > MAX_RUNTIME:
+            break
+        
+        for basis in ['Z', 'X']:
+            qc = create_rotated_ghz_FIXED(4, theta_test)
+            qc = apply_measurement_basis(qc, basis, 4)
+            counts, _ = run_measurement(qc)
+            
+            if counts:
+                discord, _ = calculate_discord_from_counts(counts, 4)
+                test7_results.append({
+                    'theta': theta_test, 'basis': basis, 'discord': discord
+                })
+    
+    print(" ✓")
+    all_results['test7'] = test7_results
+    
+    # ========================================================================
+    # TEST 8: Y and Bell Basis Check (6 measurements)
+    # ========================================================================
+    print("\nTEST 8: Y and Bell Basis Verification (6 measurements)")
+    print("  Testing problematic bases at θ = 0°, 45°, 90°")
+    print("  ", end='', flush=True)
+    
+    test8_results = []
+    for theta_test in [0, 45, 90]:
+        if time.time() - start_time > MAX_RUNTIME:
+            break
+        
+        for basis in ['Y', 'Bell']:
+            qc = create_rotated_ghz_FIXED(4, theta_test)
+            qc = apply_measurement_basis(qc, basis, 4)
+            counts, _ = run_measurement(qc)
+            
+            if counts:
+                discord, _ = calculate_discord_from_counts(counts, 4)
+                test8_results.append({
+                    'theta': theta_test, 'basis': basis, 'discord': discord
+                })
+    
+    print(" ✓")
+    all_results['test8'] = test8_results
+    
+    return all_results
+
+# ============================================================================
+# ANALYSIS
+# ============================================================================
+
+def analyze_results(results):
+    """Comprehensive analysis of all tests"""
+    
+    print("\n\n" + "="*80)
+    print("COMPREHENSIVE ANALYSIS")
+    print("="*80)
+    
+    # TEST 1 Analysis
+    if 'test1' in results and results['test1']:
+        print("\n" + "─"*80)
+        print("TEST 1: Software Implementation")
+        print("─"*80)
+        
+        for basis in ['Z', 'X']:
+            std = [r for r in results['test1'] if r['basis']==basis and r['method']=='standard']
+            man = [r for r in results['test1'] if r['basis']==basis and r['method']=='manual']
+            
+            if std and man:
+                diff = abs(std[0]['discord'] - man[0]['discord'])
+                rel = (diff / std[0]['discord'] * 100) if std[0]['discord'] > 0 else 0
+                
+                print(f"{basis}-basis: Δ = {diff:.4f} ({rel:.1f}%)", end='')
+                if rel < 3:
+                    print(" ✓ EXCELLENT")
+                elif rel < 5:
+                    print(" ✓ ACCEPTABLE")
+                else:
+                    print(" ⚠️ CONCERNING")
+    
+    # TEST 2 Analysis
+    if 'test2' in results and len(results['test2']) >= 2:
+        print("\n" + "─"*80)
+        print("TEST 2: High-Statistics Confirmation")
+        print("─"*80)
+        
+        z_d = [r['discord'] for r in results['test2'] if r['basis']=='Z'][0]
+        x_d = [r['discord'] for r in results['test2'] if r['basis']=='X'][0]
+        diff = abs(x_d - z_d)
+        rel = (diff / z_d * 100) if z_d > 0 else 0
+        
+        print(f"Z-basis: D = {z_d:.4f}")
+        print(f"X-basis: D = {x_d:.4f}")
+        print(f"Difference: {diff:.4f} ({rel:.1f}%)")
+        
+        if rel > 5:
+            print("✓ Basis-dependence confirmed at high statistics")
+        else:
+            print("⚠️ Weak basis-dependence")
+    
+    # TEST 3 Analysis
+    if 'test3' in results:
+        print("\n" + "─"*80)
+        print("TEST 3: Formula Validation")
+        print("─"*80)
+        
+        for r in results['test3']:
+            error = abs(r['discord'] - r['theory'])
+            print(f"{r['state']:10s}: D = {r['discord']:.4f} (theory: {r['theory']:.4f})", end='')
+            if error < 0.05:
+                print(" ✓")
+            else:
+                print(f" ⚠️ Error: {error:.4f}")
+    
+    # TEST 4 Analysis
+    if 'test4' in results:
+        print("\n" + "─"*80)
+        print("TEST 4: FIXED GHZ Fidelity")
+        print("─"*80)
+        
+        for r in results['test4']:
+            print(f"N={r['n_qubits']}: F = {r['fidelity']:.4f} ", end='')
+            print(f"(|0⟩={r['p_zero']:.3f}, |1⟩={r['p_one']:.3f})", end='')
+            
+            if r['fidelity'] > 0.95:
+                print(" ✓ EXCELLENT")
+            elif r['fidelity'] > 0.85:
+                print(" ⚠️ ACCEPTABLE")
+            else:
+                print(" ❌ POOR")
+    
+    # TEST 6 Analysis (KEY TEST)
+    if 'test6' in results and len(results['test6']) >= 2:
+        print("\n" + "─"*80)
+        print("TEST 6: EXTENDED REPRODUCIBILITY (10 reps)")
+        print("─"*80)
+        
+        z_data = [r for r in results['test6'] if r['basis']=='Z'][0]
+        x_data = [r for r in results['test6'] if r['basis']=='X'][0]
+        
+        print(f"\nZ-basis: {z_data['mean']:.4f} ± {z_data['std']:.4f} (n={z_data['n']})")
+        print(f"X-basis: {x_data['mean']:.4f} ± {x_data['std']:.4f} (n={x_data['n']})")
+        
+        diff = abs(x_data['mean'] - z_data['mean'])
+        combined_std = np.sqrt(x_data['std']**2 + z_data['std']**2)
+        sigma = diff / combined_std if combined_std > 0 else 0
+        
+        print(f"\nBasis difference: {diff:.4f} ± {combined_std:.4f}")
+        print(f"Statistical significance: {sigma:.2f}σ")
+        
+        if sigma >= 3.0:
+            print("✓✓✓ PUBLICATION READY (≥3σ)")
+        elif sigma >= 2.5:
+            print("✓✓ STRONG EVIDENCE (2.5-3σ)")
+        elif sigma >= 2.0:
+            print("✓ MODERATE EVIDENCE (2-2.5σ)")
+        else:
+            print("⚠️ WEAK EVIDENCE (<2σ)")
+    
+    # TEST 7 Analysis
+    if 'test7' in results:
+        print("\n" + "─"*80)
+        print("TEST 7: Angular Dependence")
+        print("─"*80)
+        
+        angles = sorted(set(r['theta'] for r in results['test7']))
+        print(f"\n{'θ':>5s} {'Z-Discord':>12s} {'X-Discord':>12s} {'Difference':>12s}")
+        print("─"*50)
+        
+        for theta in angles:
+            z_d = [r['discord'] for r in results['test7'] if r['theta']==theta and r['basis']=='Z']
+            x_d = [r['discord'] for r in results['test7'] if r['theta']==theta and r['basis']=='X']
+            
+            if z_d and x_d:
+                diff = abs(x_d[0] - z_d[0])
+                print(f"{theta:>4d}° {z_d[0]:>11.4f} {x_d[0]:>11.4f} {diff:>11.4f}")
+    
+    # Final Verdict
+    print("\n" + "="*80)
+    print("FINAL VERDICT")
+    print("="*80)
+    
+    # Check all critical tests
+    passes = 0
+    total = 6
+    
+    # Test 1
+    if 'test1' in results and len(results['test1']) >= 4:
+        try:
+            x_std = [r for r in results['test1'] if r['basis']=='X' and r['method']=='standard'][0]['discord']
+            x_man = [r for r in results['test1'] if r['basis']=='X' and r['method']=='manual'][0]['discord']
+            x_diff = abs(x_std - x_man)
+            if (x_diff / x_std) < 0.05:
+                passes += 1
+                print("✓ Test 1: Software implementation validated")
+            else:
+                print("⚠️ Test 1: Implementation discrepancy detected")
+        except:
+            print("⚠️ Test 1: Incomplete data")
+    
+    # Test 3
+    if 'test3' in results:
+        max_error = max(abs(r['discord'] - r['theory']) for r in results['test3'])
+        if max_error < 0.05:
+            passes += 1
+            print("✓ Test 3: Discord formula validated")
+        else:
+            print("⚠️ Test 3: Formula errors detected")
+    
+    # Test 4
+    if 'test4' in results:
+        min_fidelity = min(r['fidelity'] for r in results['test4'])
+        if min_fidelity > 0.85:
+            passes += 1
+            print("✓ Test 4: GHZ preparation validated")
+        else:
+            print("⚠️ Test 4: Poor GHZ fidelity detected")
+    
+    # Test 6 (CRITICAL)
+    if 'test6' in results and len(results['test6']) >= 2:
+        z_data = [r for r in results['test6'] if r['basis']=='Z'][0]
+        x_data = [r for r in results['test6'] if r['basis']=='X'][0]
+        diff = abs(x_data['mean'] - z_data['mean'])
+        combined_std = np.sqrt(x_data['std']**2 + z_data['std']**2)
+        sigma = diff / combined_std if combined_std > 0 else 0
+        
+        if sigma >= 3.0:
+            passes += 3  # Triple weight for reproducibility
+            print("✓✓✓ Test 6: HIGH SIGNIFICANCE (≥3σ) - PUBLICATION READY")
+        elif sigma >= 2.5:
+            passes += 2
+            print("✓✓ Test 6: Strong significance (2.5-3σ)")
+        elif sigma >= 2.0:
+            passes += 1
+            print("✓ Test 6: Moderate significance (2-2.5σ)")
+        else:
+            print("⚠️ Test 6: Weak significance (<2σ)")
+    
+    print(f"\nOverall: {passes}/{total} tests passed")
+    
+    if passes >= 5:
+        print("\n🎉 PUBLICATION READY - All critical tests passed!")
+        print("   Proceed with manuscript preparation.")
+    elif passes >= 4:
+        print("\n✓ NEARLY READY - Minor concerns remain")
+        print("   Consider additional measurements for weak tests.")
+    else:
+        print("\n⚠️ NOT READY - Significant issues detected")
+        print("   Debug failing tests before publication.")
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    print("="*80)
+    print("STARTING COMPREHENSIVE VERIFICATION SUITE V2")
+    print("="*80 + "\n")
+    
+    # Run all tests
+    results = test_suite_v2()
+    
+    # Analyze
+    analyze_results(results)
+    
+    # Save results
+    total_time = (time.time() - start_time) / 60
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    
+    with open(f'verification_v2_{timestamp}.json', 'w') as f:
+        json.dump(results, f, indent=2, default=str)
+    
+    # Also save as CSV for test 6 (most important)
+    if 'test6' in results:
+        with open(f'test6_extended_{timestamp}.csv', 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['basis', 'rep', 'discord'])
+            
+            for r in results['test6']:
+                for i, d in enumerate(r['discords']):
+                    writer.writerow([r['basis'], i+1, d])
+    
+    print(f"\n{'='*80}")
+    print("SUITE COMPLETE")
+    print(f"{'='*80}")
+    print(f"Total measurements: {counter.get_count()}")
+    print(f"Runtime: {total_time:.1f} minutes")
+    print(f"Results saved: verification_v2_{timestamp}.json")
+    print(f"Test 6 data: test6_extended_{timestamp}.csv")
+    print(f"{'='*80}\n")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n⚠️ Interrupted")
+        elapsed = (time.time() - start_time) / 60
+        print(f"Partial results: {counter.get_count()} measurements in {elapsed:.1f} minutes")
+    except Exception as e:
+        print(f"\n\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
